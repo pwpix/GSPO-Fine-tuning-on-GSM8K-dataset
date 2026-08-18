@@ -28,4 +28,15 @@ from datetime import datetime
 from dataclasses import dataclass, field
 import matplotlib.pyplot as plt
 
-print("All imports successful")
+logging.basicConfig(level=logging.ERROR)
+logging.getLogger('transformers').setLevel(logging.ERROR)
+logging.getLogger('trl').setLevel(logging.ERROR)
+logging.getLogger('datasets').setLevel(logging.ERROR)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+
+if torch.cuda.is_available():
+    print(f"    GPU: {torch.cuda.get_device_name(0)}")
+    print(f"    Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+
