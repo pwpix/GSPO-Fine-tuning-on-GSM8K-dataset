@@ -93,3 +93,118 @@ config = GSPOTrainingConfig(
 )
 
 print("GSPO configuration created")
+
+
+# Reward model
+# For mathematical resaon we need to:
+#       1. Extract the numerical answer from free-form text
+#       2. Check correctness by comparing to the ground truth answer
+#       3. Award partial credit for reasonable attempts even if the final answer is wrong
+
+
+# Implementation of GSM8K Reward Signal
+class GSM8KRewardSignal:
+    """Reward model for GSM8K mathematical reasoning in GSPO"""
+
+    def extract_numerical_answer(self, text: str) -> Optional[float]:
+        """Extract numerical answer from text"""
+
+        #Strategy 1: Look for #### (GSM8K format)
+        if "####" in text:
+            answer = text.split("####")[-1].strip()
+            answer = answer.replace(',', '').replace('$', '')
+            try:
+                return float(answer)
+            except:
+                return None
+        
+        #Strategy 2: Regex patterns
+        patterns = [
+            r"(?:The answer is|answer:|Answer:)\s*\$?([+-]?\d+(?:,\d{3})*(?:\.\d+)?",
+            r"(?:equals?|=)\s*\$?([+-]?\d+(?:,\d{3})*(?:\.\d+)?)",
+            r"(?:total|sum|result)\s*(?:is|:|=)?\s*\$?([+-]?\d+(?:,\d{3})*(?:\.\d+)?)"
+        ]
+
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                try:
+                    return float(matches[-1].replace(',', ''))
+                except:
+                    continue
+
+        #Strategy 3: Any number
+        numbers = re.findall(r'([+-]?\d+(?:,\d{3}*(?:\.\d+)?)', text)
+        if numbers:
+            try:
+                return float(numbers[-1].replace(',', ''))
+            except:
+                pass
+        return None
+
+    def compute_reward(self, response: str, correct_answer: float, question: str = None) -> float:
+        """Compute reward for a response"""
+
+        predicted = self.extract_numerical_answer(response)
+        has_calculation = any(word in response.lower() 
+                          for word in ['=', '+', '-', '*', '/', 'multiply', 'divide', 'add', 'subtract'])
+        has_steps = len(response.split('.')) > 2
+        has_numbers = bool(re.search(r'\d', response))
+
+        #No parsable answer
+        if predicted is None:
+            if len(response) > 200 and has_calculation and has_numbers:
+                return 0.2
+            elif has_calculation and has_numbers:
+                return 0.1
+            else:
+                return 0.05
+
+        #Correct answer
+        if abs(predicted - correct_answer) < 0.01:
+            return 1.0 + (0,2 if has_steps else 0)
+    
+        #Wrong answer - partial credit
+        relative_error = abs(predicted - correct_answer) / (abs(correct_answer) + 1e-10)
+
+        if relative_error <0.1:
+            reward = 0.8
+        elif relative_error < 0.3:
+            reward = 0.5
+        else:
+            reward = 0.15
+
+        if has_calculation and has_steps:
+            reward += 0.1
+
+            return reward
+
+reward_model = GSM8KRewardSignal()
+print("Reward model initialized")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
