@@ -184,10 +184,129 @@ print("Reward model initialized")
 
 
 
+#Data processing utilities
+
+def truncate_prompt(text: str, tokenizer, max_length: int) -> str:
+    """Truncate prompt from left to keep end context"""
+
+    tokens = tokenizer(text, add_special_tokens = False)['input_ids']
+    if len(tokens) <= max_length:
+        return text
+    truncated_tokens = tokens[-max_length: ]
+    return tokenizer.decode(truncated_tokens, skip_special_tokens=True)
 
 
+def prepare_gspo_dataset(config: GSPOTrainingConfig, tokenizer):
+    """Load and prepare GSM8K dataset for GSPO training"""
+
+    print("Loading GSM8K dataset...")
+    dataset = load_dataset("openai/gsm8k", "main")
+    train_data_full = dataset["train"]
+
+    # Split into train/validation
+    total_size = len(train_data_full)
+    train_size = int(total_size * config.train_split_ratio)
+
+    indices = list(range(total_size))
+    train_data = train_data_full.select(indices[:train_size])
+    eval_data = train_data_full.select(indices[train_size:])
+
+    def process_example(example):
+        question = example['question']
+        answer_text = example['answer']
+
+        if '####' in answer_text:
+            answer = answer_text.split('####')[-1].strip()
+            answer = answer.replace(',', '').replace('$', '')
+            try:
+                answer_num = float(answer)
+            except:
+                answer_num = 0.0
+        else:
+            answer_num = 0.0
+
+        prompt = f"Question: {question}\n\nLet's solve this step-by-step:\n"
+        prompt = truncate_prompt(prompt, tokenizer, config.max_prompt_length)
+
+        return {
+            'prompt': prompt,
+            'question': question,
+            'answer': answer_num,
+            'answer_text': answer_text
+        }
+
+    train_dataset = train_data.map(process_example)
+    eval_dataset = eval_data.map(process_example)
+
+    return train_dataset, eval_dataset
 
 
+# Evaluation callback
+
+class GSM8KEvaluationCallback(TrainerCallback):
+    """Custom callback to evaluate on GSM8K test set during training"""
+
+    def __init__(self, tokenizer, test_dataset, batch_size=32, sample_size = 0.2):
+        self.tokenizer = tokenizer
+        self.test_dataset = test_dataset
+        self.batch_size = batch_size
+        self.sample_size = sample_size
+        self.logger = logging.getLogger(__name__)
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        """Called at the end of each training step"""
+        if state.global_step > 0 and state.global_step % args.eval_steps == 0:
+            self._run_evaluation(state, kwargs.get('model', model))
+
+    def _run_evaluation(self, state, model):
+        """Run the actual evaluation"""
+        if model is None:
+            self.logger.error("[Eval-ERROR] Model is None - cannot evaluate")
+            return
+        try:
+            model.eval()
+            model.train()
+        except Exception as e:
+            self.logger.error(f"[Eval-ERROR] {type(e).__name__}: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+print("Loading model and tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
+
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"
+
+model = AutoModelForCausalLM.from_pretrained(
+    config.model_name,
+    trust_remote_code = True,
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+    use_safetensors =  True,
+)
+
+if hasattr(model, 'gradient_checkpoint_enable'):
+    model.gradient_checkpoint_enable()
+
+printf("Model loaded")
+
+print(f"DType: {next(model.parameters()).dtype}")
+
+# Prepare training data
+
+train_dataset, eval_dataset = prepare_gspo_dataset(config, tokenizer)
+print(f"Dataset prepared: train={len(train_dataset)}, eval = {len(eval_dataset)}")
+
+# Load test data
+test_dataset = None
+try:
+    gsm8k = load_dataset("openai/gsm8k", "main")
+    test_dataset = gsm8k["test"]
+    print(f"Test dataset loaded: {len(test_dataset)} examples")
+except:
+    print("Test dataset not loaded")
+
+    
 
 
 
