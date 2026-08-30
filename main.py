@@ -306,14 +306,204 @@ try:
 except:
     print("Test dataset not loaded")
 
+
+prompt2ans = {item['prompt']: (item['answer'], item['question']) 
+              for item in train_dataset}
+
+gspo_config = GRPOConfig(
+    # GSPO CORE PARAMETERS
+    importance_sampling_level="sequence",
+    loss_type="grpo",
+    beta=0.0,
+    epsilon=config.epsilon,
+    epsilon_high=config.epsilon_high,
+    steps_per_generation=config.steps_per_generation,
+
+    # Training
+    output_dir=config.output_dir,
+    num_train_epochs=config.num_train_epochs,
+    per_device_train_batch_size=config.per_device_train_batch_size,
+    gradient_accumulation_steps=config.gradient_accumulation_steps,
+    learning_rate=config.learning_rate,
     
+    # Generation
+    num_generations=config.num_generations,
+    temperature=config.temperature,
+    generation_kwargs={
+        "max_tokens": config.max_new_tokens,
+        "temperature": config.temperature,
+        "top_p": 0.95,
+    },
+
+    use_vllm=True,
+    vllm_mode="colocate",  
+    vllm_gpu_memory_utilization=0.4,
+    
+    # Optimization
+    lr_scheduler_type="linear",
+    warmup_ratio=0.03,
+    max_grad_norm=1.0,
+    weight_decay=0.1,
+    
+    # Logging 
+    logging_steps=50,
+    eval_steps=config.eval_steps,
+    save_steps=config.save_steps,
+    seed=42,
+    disable_tqdm=True,
+    log_level="error",
+    log_level_replica="error",
+    
+    # Device
+    fp16=False,
+    bf16=True if torch.cuda.is_available() else False,
+    remove_unused_columns=False,
+    push_to_hub=False,
+    report_to=[],
+)
+
+
+def compute_rewards(prompts: List[str], completions: List[str], **kwargs):
+    """Compute rewards for GSPO training"""
+    raw_rewards = [0.0] * len(completions)
+    
+    prompt_to_indices = {}
+    for idx, p in enumerate(prompts):
+        prompt_to_indices.setdefault(p, []).append(idx)
+    
+    for prompt, idx_list in prompt_to_indices.items():
+        correct_answer, question = prompt2ans.get(prompt, (0.0, ""))
+        
+        for idx in idx_list:
+            comp = completions[idx]
+            r = reward_model.compute_reward(comp, correct_answer, question)
+            raw_rewards[idx] = float(r)
+    
+    return raw_rewards
 
 
 
+class GSPOProgressCallback(TrainerCallback):
+    """Evaluate and plot GSPO training progress - minimal logging style"""
+    
+    def __init__(self, tokenizer, eval_dataset, eval_frequency_steps=20):
+        self.tokenizer = tokenizer
+        self.eval_dataset = eval_dataset
+        self.eval_frequency_steps = eval_frequency_steps
+        self.steps = []
+        self.accuracies = []
+        self.rewards = []
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step > 0 and state.global_step % self.eval_frequency_steps == 0:
+            self._evaluate(state, kwargs.get('model'))
+        
+        if state.global_step >= 80:
+            control.should_training_stop = True
+    
+    def _evaluate(self, state, model):
+        if model is None:
+            return
+        
+        try:
+            model.eval()
+            
+            # Evaluate on 50 random samples
+            num_samples = min(50, len(self.eval_dataset))
+            indices = np.random.choice(len(self.eval_dataset), num_samples, replace=False)
+            
+            correct = 0
+            rewards = []
+            
+            for idx in indices:
+                example = self.eval_dataset[int(idx)]
+                prompt = example['prompt']
+                correct_answer = example['answer']
+                
+                inputs = self.tokenizer(prompt, return_tensors='pt').to(model.device)
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=256,
+                        temperature=0.7,
+                        top_p=0.95,
+                        do_sample=False,
+                    )
+                
+                response = self.tokenizer.decode(
+                    outputs[0][inputs['input_ids'].shape[1]:], 
+                    skip_special_tokens=True
+                )
+                
+                reward = reward_model.compute_reward(response, correct_answer, example['question'])
+                rewards.append(reward)
+                
+                if reward >= 0.9:
+                    correct += 1
+            
+            accuracy = (correct / num_samples * 100) if num_samples > 0 else 0
+            mean_reward = np.mean(rewards)
+            
+            self.steps.append(state.global_step)
+            self.accuracies.append(accuracy)
+            self.rewards.append(mean_reward)
+            
+            # Simple output like Unsloth - just the key metrics
+            print(f"Step {state.global_step} | Accuracy {accuracy:.1f}% | Reward {mean_reward:.4f}")
+            self._plot()
+            
+            model.train()
+            
+        except Exception as e:
+            print(f"Eval error: {e}")
+    
+    def _plot(self):
+        """Save progress plots"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 4))
+        
+        ax1.plot(self.steps, self.accuracies, 'b-o', linewidth=2, markersize=6)
+        ax1.set_xlabel('Step', fontsize=11)
+        ax1.set_ylabel('Accuracy (%)', fontsize=11)
+        ax1.set_title('GSPO Training: Accuracy', fontsize=12, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_ylim([0, 100])
+        
+        ax2.plot(self.steps, self.rewards, 'g-s', linewidth=2, markersize=6)
+        ax2.set_xlabel('Step', fontsize=11)
+        ax2.set_ylabel('Mean Reward', fontsize=11)
+        ax2.set_title('GSPO Training: Mean Reward', fontsize=12, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        ax2.set_ylim([0, 1.0])
+        
+        plt.tight_layout()
+        plt.savefig('gspo_progress.png', dpi=100, bbox_inches='tight')
+        plt.show()
+
+trainer = GRPOTrainer(
+    model=model,
+    reward_funcs=compute_rewards,
+    args=gspo_config,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    processing_class=tokenizer,
+)
+
+if eval_dataset is not None:
+    progress_callback = GSPOProgressCallback(
+        tokenizer=tokenizer,
+        eval_dataset=eval_dataset,
+        eval_frequency_steps=config.eval_steps,
+    )
+    trainer.add_callback(progress_callback)
 
 
+print("\n" + "="*60)
+print("GSPO TRAINING")
+print("="*60 + "\n")
 
+trainer.train()
 
+print("\nTraining complete!")
 
 
 
